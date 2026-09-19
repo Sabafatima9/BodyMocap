@@ -157,6 +157,9 @@ class RetargetSolver:
         self._end_X: Dict[str, Quat] = {}
         self._head_X: Optional[Quat] = None
         self._limb_base: Dict[str, Quat] = {}
+        # local rotations that realise the calibrated neutral pose (same world
+        # pose on every topology, unlike the raw rest pose of each rig)
+        self._neutral_local: Dict[str, Quat] = {}
         self._prepare_rest()
         self.reset()
         if calibration is not None and calibration.valid and calibration.neutral is not None:
@@ -549,6 +552,7 @@ class RetargetSolver:
         self._head_X = None
         self.reset()
         self.solve(neutral, compute_pose=False)
+        self._neutral_local = dict(self._prev_local)
         J = self._map_joints(neutral)
         report: Dict[str, float] = {}
         for key, lc in self.profile.limbs.items():
@@ -587,7 +591,12 @@ class RetargetSolver:
         return rig_leg / subj
 
     def _hold_chain(self, key: str, bones: Sequence[str], res: SolveResult) -> None:
-        """Keep the previous local rotations of a chain whose joints are lost."""
+        """Keep the previous local rotations of a chain whose joints are lost.
+
+        Before the chain's first valid frame (take starts with an occluded
+        limb) the calibrated neutral pose is used, so rigs with different rest
+        poses / bone counts still agree in world space; only without a
+        calibration does the chain fall back to each rig's own rest pose."""
         n_held = self._hold.get(key, 0) + 1
         self._hold[key] = n_held
         if n_held > self.s.hold_frames:
@@ -595,6 +604,8 @@ class RetargetSolver:
         self.stats["chains_held"] += 1
         for n in bones:
             q = self._prev_local.get(n)
+            if q is None:
+                q = self._neutral_local.get(n)
             if q is None:
                 continue
             b = self.rig.bones[n]
