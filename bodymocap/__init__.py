@@ -8,7 +8,7 @@ are imported lazily so registration never fails when they are missing.
 bl_info = {
     "name": "BodyMocap",
     "author": "BodyMocap Project",
-    "version": (2, 0, 0),
+    "version": (2, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": (
@@ -27,7 +27,10 @@ if "bpy" in locals():  # support F3 > "Reload Scripts"
     for _name in sorted([m for m in sys.modules if m.startswith(__name__ + ".")], reverse=True):
         importlib.reload(sys.modules[_name])
 
-import bpy  # noqa: E402
+try:  # noqa: E402
+    import bpy
+except ImportError:  # pure-Python test / tooling context (NFR-007)
+    bpy = None
 
 _MODULES = (
     "preferences",

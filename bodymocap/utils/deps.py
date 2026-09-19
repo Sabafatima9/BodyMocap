@@ -72,10 +72,23 @@ def ensure_user_site_on_path() -> None:
         sys.path.append(p)  # append: Blender's bundled packages win
 
 
+def is_writable_dir(path: str) -> bool:
+    """True when ``path`` can be created and written to (os.access lies on Windows)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".bodymocap_write_probe")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
 def default_install_target() -> Tuple[str, bool]:
     """(directory, is_blender_site_packages)."""
     sp = blender_site_packages()
-    if os.access(sp, os.W_OK):
+    if is_writable_dir(sp):
         return sp, True
     return user_site_packages(), False
 

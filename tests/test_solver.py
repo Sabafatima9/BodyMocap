@@ -291,6 +291,24 @@ class TestRobustness(unittest.TestCase):
             zs.append(s.solve(sk).pose.head["Hips"].z)
         self.assertAlmostEqual(min(zs) - zs[0], -0.32, delta=0.01)
 
+    def test_first_frame_loss_uses_calibrated_neutral(self):
+        # A take whose first frames have an occluded wrist must not snap each rig
+        # to its own rest pose (T-pose vs A-pose arm): with a calibration, both
+        # rigs reproduce the same world pose from frame 0 (topology parity).
+        from bodymocap.core.skeleton import build_calibration
+        cal_feed = generate_feed("tpose", duration=0.7, fps=30, condition="clean")
+        cal = build_calibration([SourceSkeleton.from_pose_frame(pf) for pf in cal_feed.frames])
+        feed = generate_feed("wave", duration=0.5, fps=30, condition="clean", seed=2)
+        skels = [SourceSkeleton.from_pose_frame(pf) for pf in feed.frames]
+        skels[0].conf["wrist_L"] = 0.0
+        ra, pa = build("RigA_Standard")
+        rb, pb = build("RigB_Segmented")
+        ea = RetargetSolver(ra, pa, calibration=cal).solve(skels[0]).pose
+        eb = RetargetSolver(rb, pb, calibration=cal).solve(skels[0]).pose
+        err = (effectors("RigA_Standard", ea)["wrist_L"]
+               - effectors("RigB_Segmented", eb)["wrist_L"]).length() / ARM_LEN
+        self.assertLess(err, 0.05, f"first-frame loss parity {err:.1%}")
+
     def test_proportional_spine_distribution(self):
         rig, prof = build("RigB_Segmented")
         s = RetargetSolver(rig, prof, SolverSettings(spine_position_match=False, pelvis_tilt_share=0.0))
