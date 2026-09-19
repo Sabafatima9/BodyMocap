@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "bodymocap"
+version = "2.0.0"
+name = "BodyMocap"
+tagline = "Camera pose capture with topology-adaptive bone-chain retargeting"
+maintainer = "BodyMocap Project"
+type = "add-on"
+
+website = "https://github.com/MuhammadShahzeb123/BodyMocap"
+tags = ["Animation", "Rigging"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+camera = "Capture body motion from a webcam"
+network = "Download pose models and Python packages when requested"
+files = "Read videos, save/load takes and mapping profiles"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", ".*"]

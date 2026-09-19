@@ -1,10 +1,12 @@
-"""MediaPipe Pose 33-landmark naming and semantic roles (pure Python)."""
+"""MediaPipe Pose 33-landmark naming and coordinate conventions (pure Python)."""
 
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-# Standard MediaPipe Pose landmark index → name
+from .types import Vec3
+
+# Standard MediaPipe Pose landmark index -> name
 MEDIAPIPE_POSE_NAMES: Dict[int, str] = {
     0: "nose",
     1: "left_eye_inner",
@@ -41,13 +43,19 @@ MEDIAPIPE_POSE_NAMES: Dict[int, str] = {
     32: "right_foot_index",
 }
 
-# Skeleton edges for overlay (parent, child)
+MEDIAPIPE_POSE_INDEX: Dict[str, int] = {v: k for k, v in MEDIAPIPE_POSE_NAMES.items()}
+
+# Skeleton edges for overlays (parent, child)
 POSE_CONNECTIONS: List[Tuple[str, str]] = [
     ("left_shoulder", "right_shoulder"),
     ("left_shoulder", "left_elbow"),
     ("left_elbow", "left_wrist"),
+    ("left_wrist", "left_index"),
+    ("left_wrist", "left_pinky"),
     ("right_shoulder", "right_elbow"),
     ("right_elbow", "right_wrist"),
+    ("right_wrist", "right_index"),
+    ("right_wrist", "right_pinky"),
     ("left_shoulder", "left_hip"),
     ("right_shoulder", "right_hip"),
     ("left_hip", "right_hip"),
@@ -55,48 +63,40 @@ POSE_CONNECTIONS: List[Tuple[str, str]] = [
     ("left_knee", "left_ankle"),
     ("right_hip", "right_knee"),
     ("right_knee", "right_ankle"),
+    ("left_ankle", "left_heel"),
+    ("left_heel", "left_foot_index"),
     ("left_ankle", "left_foot_index"),
+    ("right_ankle", "right_heel"),
+    ("right_heel", "right_foot_index"),
     ("right_ankle", "right_foot_index"),
-    ("nose", "left_shoulder"),
-    ("nose", "right_shoulder"),
+    ("left_ear", "left_eye"),
+    ("left_eye", "nose"),
+    ("right_ear", "right_eye"),
+    ("right_eye", "nose"),
 ]
 
-# Semantic bone roles → (parent_landmark, child_landmark)
-ROLE_LANDMARK_PAIRS: Dict[str, Tuple[str, str]] = {
-    "hips": ("left_hip", "right_hip"),  # special: mid-hip orientation
-    "spine": ("hips_mid", "shoulders_mid"),
-    "chest": ("hips_mid", "shoulders_mid"),
-    "neck": ("shoulders_mid", "nose"),
-    "head": ("shoulders_mid", "nose"),
-    "upper_arm_L": ("left_shoulder", "left_elbow"),
-    "forearm_L": ("left_elbow", "left_wrist"),
-    "hand_L": ("left_wrist", "left_index"),
-    "upper_arm_R": ("right_shoulder", "right_elbow"),
-    "forearm_R": ("right_elbow", "right_wrist"),
-    "hand_R": ("right_wrist", "right_index"),
-    "thigh_L": ("left_hip", "left_knee"),
-    "shin_L": ("left_knee", "left_ankle"),
-    "foot_L": ("left_ankle", "left_foot_index"),
-    "thigh_R": ("right_hip", "right_knee"),
-    "shin_R": ("right_knee", "right_ankle"),
-    "foot_R": ("right_ankle", "right_foot_index"),
-    "clavicle_L": ("shoulders_mid", "left_shoulder"),
-    "clavicle_R": ("shoulders_mid", "right_shoulder"),
-}
-
-REQUIRED_ROLES: List[str] = [
-    "hips",
-    "spine",
-    "upper_arm_L",
-    "forearm_L",
-    "upper_arm_R",
-    "forearm_R",
-    "thigh_L",
-    "shin_L",
-    "thigh_R",
-    "shin_R",
-]
+# Landmarks that matter for body retargeting (face mesh points excluded).
+BODY_LANDMARKS: Tuple[str, ...] = (
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_pinky", "right_pinky",
+    "left_index", "right_index", "left_thumb", "right_thumb",
+    "left_hip", "right_hip", "left_knee", "right_knee",
+    "left_ankle", "right_ankle", "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+)
 
 
-def mid_name(a: str, b: str) -> str:
-    return f"mid_{a}_{b}"
+def mp_world_to_capture(x: float, y: float, z: float) -> Vec3:
+    """MediaPipe world axes (x right, y down, z away from camera) -> capture space.
+
+    Capture space uses Blender conventions for a subject facing the camera:
+    +X = subject's left (image right), +Y = away from camera, +Z = up.
+    The mapping is a proper rotation (det = +1).
+    """
+    return Vec3(x, z, -y)
+
+
+def capture_to_mp_world(v: Vec3) -> Tuple[float, float, float]:
+    """Inverse of :func:`mp_world_to_capture`."""
+    return (v.x, -v.z, v.y)

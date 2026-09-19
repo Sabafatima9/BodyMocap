@@ -1,157 +1,177 @@
-"""Transfer animation between armatures via N:M chain remapping (FR-070–076).
+"""Armature -> armature retargeting via pseudo-landmarks (FR-070-076).
 
-Blender-dependent parts are guarded; pure remap helpers work offline.
+An existing Action on a *source* armature is converted, frame by frame, into
+the same canonical :class:`SourceSkeleton` a camera would produce (joint
+positions + hand/foot/head reference points rigidly attached to the source
+bones).  The target is then solved with the regular topology-agnostic solver,
+so any source topology maps onto any target topology.  The target solver is
+calibrated on the source's rest pose so rest-to-rest maps to identity.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from ..core.math3d import quat_identity, quat_normalize
-from ..core.types import ChainDefinition, Quat
-from .chains import detect_chains, pair_chains
-from .proportional import remap_chain
-
-
-def remap_pose_dict(
-    source_rotations: Dict[str, Quat],
-    source_chains: Dict[str, ChainDefinition],
-    target_chains: Dict[str, ChainDefinition],
-    source_lengths: Optional[Dict[str, List[float]]] = None,
-    target_lengths: Optional[Dict[str, List[float]]] = None,
-) -> Dict[str, Quat]:
-    """Remap one frame of bone rotations from source chains to target chains."""
-    source_lengths = source_lengths or {}
-    target_lengths = target_lengths or {}
-    result: Dict[str, Quat] = {}
-    pairs = pair_chains(source_chains, target_chains)
-    for src_chain, tgt_chain in pairs:
-        src_bones = src_chain.bone_names
-        tgt_bones = tgt_chain.bone_names
-        deltas = [
-            quat_normalize(source_rotations.get(b, quat_identity()))
-            for b in src_bones
-        ]
-        s_len = source_lengths.get(src_chain.name) or [1.0] * len(src_bones)
-        t_len = target_lengths.get(tgt_chain.name) or [1.0] * len(tgt_bones)
-        # pad/truncate lengths
-        if len(s_len) != len(src_bones):
-            s_len = [1.0] * len(src_bones)
-        if len(t_len) != len(tgt_bones):
-            t_len = [1.0] * len(tgt_bones)
-        remapped = remap_chain(deltas, s_len, t_len)
-        for bone, q in zip(tgt_bones, remapped):
-            result[bone] = q
-    return result
+from ..core.math3d import quat_conjugate
+from ..core.skeleton import SourceSkeleton
+from ..core.types import CalibrationData, Quat, Vec3
+from .rig import PoseState, RigModel
+from .solver import RetargetSolver, SolverSettings
+from .topology import TopologyProfile, detect_topology
 
 
-def transfer_action_frames(
-    frames: List[Dict[str, Quat]],
-    source_bone_names: Sequence[str],
-    target_bone_names: Sequence[str],
-    source_lengths: Optional[Dict[str, List[float]]] = None,
-    target_lengths: Optional[Dict[str, List[float]]] = None,
-) -> List[Dict[str, Quat]]:
-    """Batch-remap a list of pose dicts."""
-    src_chains = detect_chains(list(source_bone_names))
-    tgt_chains = detect_chains(list(target_bone_names))
-    out = []
-    for fr in frames:
-        out.append(
-            remap_pose_dict(fr, src_chains, tgt_chains, source_lengths, target_lengths)
-        )
-    return out
+class LandmarkRig:
+    """Derives capture-space pseudo-landmarks from a posed rig."""
+
+    def __init__(self, rig: RigModel, profile: TopologyProfile):
+        self.rig = rig
+        self.profile = profile
+        self.ref = RetargetSolver(rig, profile)  # reuse rest analysis (frames, M)
+        self.Minv = quat_conjugate(self.ref.M)
+        self.points: Dict[str, Tuple[str, Vec3]] = {}
+        self._build_attachments()
+
+    def _attach(self, name: str, bone: Optional[str], rest_point: Vec3) -> None:
+        if bone:
+            self.points[name] = (bone, rest_point)
+
+    def _build_attachments(self) -> None:
+        s = self.ref
+        prof = self.profile
+        scale = max(s.chord0.length() / 0.47, 1e-3)  # relative to the reference body
+        for key, lc in prof.limbs.items():
+            r = s.limb_rest[key]
+            sd = lc.side
+            first = (lc.upper or lc.lower)[0]
+            if lc.kind == "arm":
+                self._attach(f"shoulder_{sd}", first, r.S0)
+                elbow_bone = lc.lower[0] if lc.lower else first
+                self._attach(f"elbow_{sd}", elbow_bone, r.E0 if lc.lower else r.E0)
+                self._attach(f"wrist_{sd}", lc.end or lc.bones[-1], r.W0)
+                if lc.end and r.end_frame0 is not None:
+                    aim = r.end_frame0.rotate(Vec3(0, 1, 0))
+                    nrm = r.end_frame0.rotate(Vec3(0, 0, 1))
+                    side_ax = aim.cross(nrm)  # X axis of the hand frame
+                    sgn = 1.0 if sd == "L" else -1.0
+                    L = 0.085 * scale
+                    self._attach(f"index_{sd}", lc.end, r.W0 + aim * L - side_ax * (0.0325 * scale * sgn))
+                    self._attach(f"pinky_{sd}", lc.end, r.W0 + aim * (L * 0.95) + side_ax * (0.0325 * scale * sgn))
+                    self._attach(f"thumb_{sd}", lc.end, r.W0 + aim * (L * 0.6) - side_ax * (0.06 * scale * sgn))
+            else:
+                self._attach(f"hip_{sd}", first, r.S0)
+                self._attach(f"knee_{sd}", lc.lower[0] if lc.lower else first, r.E0)
+                self._attach(f"ankle_{sd}", lc.end or lc.bones[-1], r.W0)
+                if lc.end and r.end_aim0 is not None:
+                    toe_bone = lc.extra[0] if lc.extra else lc.end
+                    self._attach(f"toe_{sd}", toe_bone, r.W0 + r.end_aim0 * (0.19 * scale))
+                    self._attach(f"heel_{sd}", lc.end, r.W0 - r.end_aim0 * (0.05 * scale) - s.up0 * (0.07 * scale))
+        head = prof.head
+        if head:
+            hb = self.rig.bones[head]
+            center = hb.head + s.up0 * (0.095 * scale)
+            left, back, up = s.left0, s.back0, s.up0
+            import math
+            drop = 0.1 * math.tan(s.s.head_pitch_offset)
+            self._attach("ear_L", head, center + left * (0.075 * scale))
+            self._attach("ear_R", head, center - left * (0.075 * scale))
+            self._attach("nose", head, center - back * (0.10 * scale) - up * (drop * scale))
+            self._attach("eye_L", head, center + left * (0.033 * scale) - back * (0.083 * scale) + up * (0.013 * scale))
+            self._attach("eye_R", head, center - left * (0.033 * scale) - back * (0.083 * scale) + up * (0.013 * scale))
+
+    def skeleton(self, pose: PoseState, timestamp: float = 0.0, index: int = 0,
+                 with_root: bool = True) -> SourceSkeleton:
+        sk = SourceSkeleton(timestamp=timestamp, frame_index=index)
+        pts = {name: pose.point(bone, p) for name, (bone, p) in self.points.items()}
+        if "hip_L" not in pts or "hip_R" not in pts:
+            return sk
+        hm = pts["hip_L"].lerp(pts["hip_R"], 0.5)
+        for name, p in pts.items():
+            sk.joints[name] = self.Minv.rotate(p - hm)
+            sk.conf[name] = 1.0
+        if with_root:
+            sk.root = self.Minv.rotate(hm)
+            sk.root_conf = 1.0
+        return sk.derive()
+
+    def rest_skeleton(self) -> SourceSkeleton:
+        return self.skeleton(self.rig.rest_pose())
+
+
+def transfer_frames(
+    source_rig: RigModel,
+    source_profile: TopologyProfile,
+    source_poses: List[PoseState],
+    target_rig: RigModel,
+    target_profile: TopologyProfile,
+    settings: Optional[SolverSettings] = None,
+    fps: float = 24.0,
+):
+    """Retarget a list of source poses; returns (results, source skeletons)."""
+    lr = LandmarkRig(source_rig, source_profile)
+    rest = lr.rest_skeleton()
+    cal = CalibrationData(valid=True, neutral=rest, root_origin=rest.root.copy() if rest.root else None)
+    legs = [lr.ref.limb_rest[k].leg_length for k in ("leg_L", "leg_R") if k in lr.ref.limb_rest]
+    cal.scale = max(legs) if legs else 0.0
+    solver = RetargetSolver(target_rig, target_profile, settings, cal)
+    skels = [lr.skeleton(p, timestamp=i / fps, index=i) for i, p in enumerate(source_poses)]
+    return [solver.solve(sk) for sk in skels], skels
 
 
 def transfer_in_blender(
-    source_armature_name: str,
-    target_armature_name: str,
+    source_obj,
+    target_obj,
     action_name: str,
     new_action_name: str,
     start_frame: int = 1,
-) -> Tuple[bool, str]:
-    """Blender-side transfer: source Action → new Action on target (FR-076)."""
-    try:
-        import bpy
-        from mathutils import Quaternion
-    except ImportError:
-        return False, "bpy not available"
+    source_profile: Optional[TopologyProfile] = None,
+    target_profile: Optional[TopologyProfile] = None,
+    settings: Optional[SolverSettings] = None,
+    rotation_mode: str = "QUATERNION",
+):
+    """Blender-side: sample the source Action and write a new Action on target."""
+    import bpy
 
-    src = bpy.data.objects.get(source_armature_name)
-    tgt = bpy.data.objects.get(target_armature_name)
-    if src is None or src.type != "ARMATURE":
-        return False, f"Source armature not found: {source_armature_name}"
-    if tgt is None or tgt.type != "ARMATURE":
-        return False, f"Target armature not found: {target_armature_name}"
+    from ..bake.action import BakeSettings, write_action
 
-    action = bpy.data.actions.get(action_name)
+    action = bpy.data.actions.get(action_name) if action_name else None
+    if action is None and source_obj.animation_data:
+        action = source_obj.animation_data.action
     if action is None:
-        if src.animation_data and src.animation_data.action:
-            action = src.animation_data.action
-        else:
-            return False, f"Action not found: {action_name}"
+        return False, f"No action to retarget on {source_obj.name}", None
+    src_rig = RigModel.from_blender(source_obj)
+    tgt_rig = RigModel.from_blender(target_obj)
+    src_prof = source_profile or detect_topology(src_rig)
+    tgt_prof = target_profile or detect_topology(tgt_rig)
+    errs = src_prof.validate(src_rig) + tgt_prof.validate(tgt_rig)
+    if errs:
+        return False, "Topology problem: " + "; ".join(errs[:3]), None
 
-    src_bones = [b.name for b in src.data.bones]
-    tgt_bones = [b.name for b in tgt.data.bones]
-    src_chains = detect_chains(src_bones)
-    tgt_chains = detect_chains(tgt_bones)
-
-    # Rest lengths from edit bones (head-tail)
-    def bone_lengths(arm_obj, chain: ChainDefinition) -> List[float]:
-        lengths = []
-        for bn in chain.bone_names:
-            bone = arm_obj.data.bones.get(bn)
-            if bone:
-                lengths.append((bone.tail_local - bone.head_local).length)
-            else:
-                lengths.append(1.0)
-        return lengths
-
-    src_lens = {n: bone_lengths(src, c) for n, c in src_chains.items()}
-    tgt_lens = {n: bone_lengths(tgt, c) for n, c in tgt_chains.items()}
-
-    # Sample frames from action
-    frame_start = int(action.frame_range[0])
-    frame_end = int(action.frame_range[1])
+    if source_obj.animation_data is None:
+        source_obj.animation_data_create()
+    prev = source_obj.animation_data.action
+    from ..utils.anim_compat import assign_action
+    assign_action(source_obj, action)
     scene = bpy.context.scene
-
-    if new_action_name in bpy.data.actions:
-        new_action = bpy.data.actions[new_action_name]
-        # clear fcurves
-        for fc in list(new_action.fcurves):
-            new_action.fcurves.remove(fc)
-    else:
-        new_action = bpy.data.actions.new(new_action_name)
-
-    if tgt.animation_data is None:
-        tgt.animation_data_create()
-    prev_action = tgt.animation_data.action
-    tgt.animation_data.action = new_action
-
-    # Ensure pose mode rotations are quaternion
-    for pb in tgt.pose.bones:
-        pb.rotation_mode = "QUATERNION"
-
-    # Temporarily evaluate source
-    if src.animation_data is None:
-        src.animation_data_create()
-    src.animation_data.action = action
-
-    for f in range(frame_start, frame_end + 1):
+    f0, f1 = (int(round(v)) for v in action.frame_range)
+    keep = scene.frame_current
+    poses: List[PoseState] = []
+    for f in range(f0, f1 + 1):
         scene.frame_set(f)
-        src_rots: Dict[str, Quat] = {}
-        for pb in src.pose.bones:
-            q = pb.rotation_quaternion
-            src_rots[pb.name] = Quat(q.w, q.x, q.y, q.z)
-        remapped = remap_pose_dict(src_rots, src_chains, tgt_chains, src_lens, tgt_lens)
-        out_frame = start_frame + (f - frame_start)
-        for bone_name, q in remapped.items():
-            pb = tgt.pose.bones.get(bone_name)
-            if pb is None:
-                continue
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = Quaternion((q.w, q.x, q.y, q.z))
-            pb.keyframe_insert(data_path="rotation_quaternion", frame=out_frame)
-
-    tgt.animation_data.action = new_action
-    return True, f"Created action '{new_action_name}' on {target_armature_name}"
+        local: Dict[str, Quat] = {}
+        loc: Dict[str, Vec3] = {}
+        for pb in source_obj.pose.bones:
+            q = pb.matrix_basis.to_quaternion()
+            local[pb.name] = Quat(q.w, q.x, q.y, q.z)
+            t = pb.matrix_basis.translation
+            if t.length > 1e-9:
+                loc[pb.name] = Vec3(t.x, t.y, t.z)
+        poses.append(src_rig.fk(local, loc))
+    scene.frame_set(keep)
+    if prev is not action:
+        source_obj.animation_data.action = prev
+    fps = scene.render.fps / scene.render.fps_base
+    results, _ = transfer_frames(src_rig, src_prof, poses, tgt_rig, tgt_prof, settings, fps)
+    bs = BakeSettings(action_name=new_action_name, start_frame=start_frame, overwrite=True,
+                      rotation_mode=rotation_mode, fps=fps)
+    act, keys, _ = write_action(target_obj, results, bs)
+    return True, f"Retargeted {len(results)} frames '{action.name}' -> '{act.name}' ({keys} keys)", act

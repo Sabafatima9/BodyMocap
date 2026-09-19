@@ -1,397 +1,140 @@
-"""Camera start/stop, calibration, and modal capture loop (FR-010–016)."""
+"""POSE_OT_spawn_camera: a scene camera that matches the physical tracking camera."""
 
 from __future__ import annotations
 
-import time
-from typing import Any, Dict, Optional
+import math
 
-try:
-    import bpy
-    from bpy.types import Operator
-except ImportError:
-    bpy = None
-    Operator = object  # type: ignore
+import bpy
+from bpy.props import BoolProperty
+from bpy.types import Operator
+from mathutils import Vector
 
-# Module state for modal operator
-_BACKEND = None
-_CALIBRATION_SAMPLES = []
-_LAST_LANDMARKS = None
-_LAST_POSE_FRAME = None
-_POLICY = None
-_CALIBRATION = None
-_FRAME_COUNTER = 0
-_LAST_TICK = 0.0
+CAMERA_NAME = "BodyMocap_TrackingCam"
 
 
-def get_runtime_calibration():
-    return _CALIBRATION
+def armature_bounds(obj):
+    """World-space (min, max) over bone heads/tails of the current pose."""
+    mw = obj.matrix_world
+    pts = []
+    for pb in obj.pose.bones:
+        pts.append(mw @ pb.head)
+        pts.append(mw @ pb.tail)
+    if not pts:
+        c = mw.translation
+        return c - Vector((0.5, 0.5, 1.0)), c + Vector((0.5, 0.5, 1.0))
+    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return mn, mx
 
 
-def get_last_landmarks():
-    return _LAST_LANDMARKS
+def rig_forward_up(obj):
+    """World-space facing direction and up axis of a humanoid armature."""
+    try:
+        from ..retarget.rig import RigModel
+        from ..retarget.solver import RetargetSolver
+        from ..runtime import get_profile
+        rig = RigModel.from_blender(obj)
+        solver = RetargetSolver(rig, get_profile(obj, rig))
+        m3 = obj.matrix_world.to_3x3()
+        fwd = (m3 @ Vector(tuple(-solver.back0))).normalized()
+        up = (m3 @ Vector(tuple(solver.up0))).normalized()
+        return fwd, up
+    except Exception:
+        m3 = obj.matrix_world.to_3x3()
+        return (m3 @ Vector((0, -1, 0))).normalized(), (m3 @ Vector((0, 0, 1))).normalized()
 
 
-def _make_backend(settings):
-    from ..core.confidence import ConfidenceConfig
-    from ..pose.mediapipe_backend import MediaPipeBackend, mediapipe_available
-    from ..pose.mock_backend import MockBackend
+def spawn_tracking_camera(context, target=None, fov_deg=60.0, width=640, height=480,
+                          distance=0.0, make_active=True, set_resolution=True):
+    scene = context.scene
+    cam_obj = bpy.data.objects.get(CAMERA_NAME)
+    if cam_obj is None or cam_obj.type != "CAMERA":
+        cam_data = bpy.data.cameras.new(CAMERA_NAME)
+        cam_obj = bpy.data.objects.new(CAMERA_NAME, cam_data)
+    if cam_obj.name not in scene.collection.all_objects:
+        scene.collection.objects.link(cam_obj)
+    cam = cam_obj.data
+    cam.type = "PERSP"
+    cam.sensor_fit = "HORIZONTAL"
+    cam.sensor_width = 36.0
+    cam.angle = math.radians(fov_deg)
+    cam.clip_start = 0.05
+    cam.clip_end = 200.0
 
-    cfg = ConfidenceConfig(min_confidence=settings.min_confidence)
-    if settings.pose_backend == "MEDIAPIPE":
-        if not mediapipe_available():
-            return None, "MediaPipe not installed. Use Mock backend or install deps (INSTALL.md)."
-        be = MediaPipeBackend(cfg)
-        if not be.initialize():
-            return None, "Failed to initialize MediaPipe Pose."
-        return be, ""
-    be = MockBackend(
-        fixture_path=settings.fixture_path or None,
-        mode=settings.mock_mode,
-        confidence_cfg=cfg,
-    )
-    be.initialize(fixture_path=settings.fixture_path or None, mode=settings.mock_mode)
-    return be, ""
+    if target is not None:
+        mn, mx = armature_bounds(target)
+        fwd, up = rig_forward_up(target)
+    else:
+        mn, mx = Vector((-0.5, -0.3, 0.0)), Vector((0.5, 0.3, 1.8))
+        fwd, up = Vector((0, -1, 0)), Vector((0, 0, 1))
+    center = (mn + mx) * 0.5
+    height_m = max((mx - mn).dot(up), 0.5)
+    vfov = 2.0 * math.atan(math.tan(math.radians(fov_deg) * 0.5) * height / max(width, 1))
+    dist = distance if distance > 0.0 else (height_m * 0.6) / math.tan(vfov * 0.5)
+    cam_obj.location = center + fwd * dist
+    direction = (center - cam_obj.location).normalized()
+    cam_obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+    cam_obj["bodymocap_fov"] = float(fov_deg)
+    cam_obj["bodymocap_target"] = target.name if target else ""
 
+    if set_resolution:
+        scene.render.resolution_x = int(width)
+        scene.render.resolution_y = int(height)
+        scene.render.resolution_percentage = 100
+        scene.render.pixel_aspect_x = scene.render.pixel_aspect_y = 1.0
+    if make_active:
+        scene.camera = cam_obj
 
-def _mapping_dict(settings) -> Dict[str, str]:
-    return {e.role: e.bone_name for e in settings.mapping_entries if e.role and e.bone_name}
-
-
-class BODYMOCAP_OT_camera_start(Operator):
-    bl_idname = "bodymocap.camera_start"
-    bl_label = "Start Camera"
-    bl_description = "Start webcam (or mock) capture loop"
-
-    _timer = None
-
-    def execute(self, context):
-        global _BACKEND, _POLICY, _FRAME_COUNTER, _LAST_TICK, _CALIBRATION_SAMPLES
-
-        from ..camera.capture import get_capture
-        from ..core.confidence import HoldInterpolatePolicy
-        from ..utils.blender_compat import check_opencv, is_supported_blender, version_warning_message
-        from ..utils.logging_util import log_info, reset_session_stats, update_session_stats
-
-        if not is_supported_blender():
-            self.report({"ERROR"}, version_warning_message())
-            return {"CANCELLED"}
-
-        settings = context.scene.bodymocap
-        if settings.camera_active:
-            self.report({"WARNING"}, "Camera already active")
-            return {"CANCELLED"}
-
-        backend, err = _make_backend(settings)
-        if backend is None:
-            self.report({"ERROR"}, err)
-            return {"CANCELLED"}
-
-        use_real_camera = settings.pose_backend == "MEDIAPIPE"
-        if use_real_camera:
-            ok_cv, _ = check_opencv()
-            if not ok_cv:
-                self.report(
-                    {"ERROR"},
-                    "OpenCV required for camera. Install opencv-python-headless into Blender's Python. See INSTALL.md.",
-                )
-                backend.shutdown()
-                return {"CANCELLED"}
-            cap = get_capture()
-            if not cap.open(settings.camera_device_index):
-                self.report({"ERROR"}, cap.last_error or "Failed to open camera")
-                backend.shutdown()
-                return {"CANCELLED"}
-        else:
-            # Mock path — no camera device required
-            log_info("Starting mock/offline pose loop (no camera)")
-
-        _BACKEND = backend
-        _POLICY = HoldInterpolatePolicy(mode=settings.lost_policy)
-        _FRAME_COUNTER = 0
-        _LAST_TICK = time.time()
-        _CALIBRATION_SAMPLES = []
-        reset_session_stats()
-        update_session_stats(
-            device_index=settings.camera_device_index if use_real_camera else -1,
-            backend=backend.name,
-        )
-
-        settings.camera_active = True
-        settings.tracking_status = "OK"
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.033, window=context.window)
-        wm.modal_handler_add(self)
-        self.report({"INFO"}, f"Capture started ({backend.name})")
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        global _FRAME_COUNTER, _LAST_TICK, _LAST_LANDMARKS, _LAST_POSE_FRAME, _CALIBRATION
-
-        settings = context.scene.bodymocap
-        if not settings.camera_active:
-            return self._finish(context, cancelled=False)
-
-        if event.type == "ESC":
-            return self._finish(context, cancelled=True)
-
-        if event.type != "TIMER":
-            return {"PASS_THROUGH"}
-
-        from ..camera.capture import get_capture
-        from ..camera.preview import ensure_preview_area, numpy_bgr_to_blender_image
-        from ..core.types import TrackingState
-        from ..mapping.apply_pose import apply_landmarks_to_rotations, apply_rotations_to_armature
-        from ..overlay.draw import draw_skeleton_opencv
-        from ..recording.session import get_active_session
-        from ..utils.logging_util import record_frame, update_session_stats
-
-        frame_bgr = None
-        cap = get_capture()
-        if settings.pose_backend == "MEDIAPIPE" and cap.is_open:
-            ok, frame_bgr = cap.read()
-            if not ok or frame_bgr is None:
-                settings.tracking_status = "Lost"
-                self.report({"WARNING"}, "Failed to read camera frame")
-                return {"PASS_THROUGH"}
-            if settings.mirror_preview:
-                frame_bgr = cap.mirror_frame(frame_bgr)
-
-        now = time.time()
-        dt = max(now - _LAST_TICK, 1e-6)
-        _LAST_TICK = now
-        fps = 1.0 / dt
-        update_session_stats(fps=fps)
-
-        pose = _BACKEND.infer(frame_bgr, frame_index=_FRAME_COUNTER, timestamp=now)
-        _FRAME_COUNTER += 1
-        _LAST_POSE_FRAME = pose
-
-        landmarks = pose.landmarks
-        state = pose.tracking_state
-        processed = _POLICY.process(landmarks, state) if _POLICY else landmarks
-        if processed is not None:
-            _LAST_LANDMARKS = processed
-            landmarks = processed
-
-        settings.tracking_status = state.name
-        record_frame(low_confidence=(state != TrackingState.OK))
-
-        # Overlay on preview
-        if frame_bgr is not None:
-            drawn = draw_skeleton_opencv(
-                frame_bgr,
-                landmarks,
-                threshold=settings.min_confidence,
-                enabled=settings.show_overlay,
-            )
-            numpy_bgr_to_blender_image(drawn)
-            ensure_preview_area()
-
-        # Live apply to armature
-        role_map = _mapping_dict(settings)
-        bone_rots = {}
-        if settings.live_apply and role_map and landmarks:
-            bone_rots = apply_landmarks_to_rotations(
-                landmarks, role_map, get_runtime_calibration()
-            )
-            arm = context.active_object
-            if arm and arm.type == "ARMATURE" and bone_rots:
-                # Scale subject
-                apply_rotations_to_armature(arm, bone_rots)
-
-        # Recording
-        session = get_active_session()
-        if session.is_recording and not session.is_paused and bone_rots:
-            session.append(
-                frame_index=session.frame_count(),
-                bone_rotations=bone_rots,
-                tracking_state=state,
-                timestamp=now,
-            )
-            settings.record_frame_count = session.frame_count()
-
-        return {"PASS_THROUGH"}
-
-    def _finish(self, context, cancelled=False):
-        global _BACKEND
-        settings = context.scene.bodymocap
-        settings.camera_active = False
-        wm = context.window_manager
-        if self._timer:
-            wm.event_timer_remove(self._timer)
-            self._timer = None
-        from ..camera.capture import get_capture
-
-        get_capture().close()
-        if _BACKEND:
-            _BACKEND.shutdown()
-            _BACKEND = None
-        from ..utils.logging_util import log_info, session_summary
-
-        log_info(session_summary())
-        self.report({"INFO"}, "Camera stopped" if not cancelled else "Camera cancelled")
-        return {"CANCELLED"} if cancelled else {"FINISHED"}
+    # live feed as camera background (visible in camera view)
+    from ..camera.preview import ensure_preview_image
+    img = ensure_preview_image(width, height)
+    cam.show_background_images = True
+    bg = None
+    for b in cam.background_images:
+        if b.image == img:
+            bg = b
+            break
+    if bg is None:
+        bg = cam.background_images.new()
+        bg.image = img
+    bg.alpha = 0.85
+    bg.display_depth = "BACK"
+    bg.frame_method = "FIT"
+    return cam_obj
 
 
-class BODYMOCAP_OT_camera_stop(Operator):
-    bl_idname = "bodymocap.camera_stop"
-    bl_label = "Stop Camera"
+class POSE_OT_spawn_camera(Operator):
+    """Create (or update) a camera matching the tracking camera's field of view,
+    aimed at the target armature, with the live feed as its background"""
+
+    bl_idname = "pose.spawn_camera"
+    bl_label = "Spawn Tracking Camera"
+    bl_options = {"REGISTER", "UNDO"}
+
+    make_active: BoolProperty(name="Set as Scene Camera", default=True)
+    set_resolution: BoolProperty(name="Match Render Resolution", default=True)
 
     def execute(self, context):
-        settings = context.scene.bodymocap
-        if not settings.camera_active:
-            self.report({"WARNING"}, "Camera is not active")
-            return {"CANCELLED"}
-        settings.camera_active = False
-        from ..camera.capture import get_capture
-
-        get_capture().close()
-        self.report({"INFO"}, "Camera stop requested")
+        s = context.scene.bodymocap
+        target = s.target
+        if target is None and context.active_object and context.active_object.type == "ARMATURE":
+            target = context.active_object
+        cam = spawn_tracking_camera(context, target, s.tracking_fov, s.capture_width,
+                                    s.capture_height, s.camera_distance, self.make_active,
+                                    self.set_resolution)
+        self.report({"INFO"}, f"{cam.name}: {s.tracking_fov:.0f} deg FOV, "
+                              f"{s.capture_width}x{s.capture_height}")
         return {"FINISHED"}
 
 
-class BODYMOCAP_OT_calibrate(Operator):
-    bl_idname = "bodymocap.calibrate"
-    bl_label = "Calibrate Rest Pose"
-    bl_description = "Average landmarks over N seconds while holding T/A pose (FR-013–014)"
-
-    _timer = None
-    _start = 0.0
-    _samples = None
-    _backend = None
-    _use_live = False
-
-    def execute(self, context):
-        global _CALIBRATION
-
-        from ..utils.blender_compat import is_supported_blender, version_warning_message
-
-        if not is_supported_blender():
-            self.report({"ERROR"}, version_warning_message())
-            return {"CANCELLED"}
-
-        settings = context.scene.bodymocap
-        self._samples = []
-        self._start = time.time()
-        self._use_live = bool(settings.camera_active and get_last_landmarks())
-
-        if not self._use_live:
-            backend, err = _make_backend(settings)
-            if backend is None:
-                self.report({"ERROR"}, err)
-                return {"CANCELLED"}
-            self._backend = backend
-            # For MediaPipe without active camera, try open briefly
-            if settings.pose_backend == "MEDIAPIPE":
-                from ..camera.capture import get_capture
-                from ..utils.blender_compat import check_opencv
-
-                ok_cv, _ = check_opencv()
-                if not ok_cv:
-                    self.report({"ERROR"}, "OpenCV required for live calibration with MediaPipe.")
-                    backend.shutdown()
-                    return {"CANCELLED"}
-                cap = get_capture()
-                if not cap.is_open and not cap.open(settings.camera_device_index):
-                    self.report({"ERROR"}, cap.last_error or "Cannot open camera for calibration")
-                    backend.shutdown()
-                    return {"CANCELLED"}
-
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.05, window=context.window)
-        wm.modal_handler_add(self)
-        self.report(
-            {"INFO"},
-            f"Calibrating {settings.rest_pose_style} for {settings.calibration_seconds:.1f}s — hold pose",
-        )
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        global _CALIBRATION
-
-        settings = context.scene.bodymocap
-        if event.type == "ESC":
-            return self._done(context, ok=False)
-
-        if event.type != "TIMER":
-            return {"PASS_THROUGH"}
-
-        elapsed = time.time() - self._start
-        landmarks = None
-        if self._use_live:
-            landmarks = get_last_landmarks()
-        else:
-            frame_bgr = None
-            if settings.pose_backend == "MEDIAPIPE":
-                from ..camera.capture import get_capture
-
-                ok, frame_bgr = get_capture().read()
-                if not ok:
-                    self.report({"ERROR"}, "Lost camera during calibration")
-                    return self._done(context, ok=False)
-                if settings.mirror_preview:
-                    frame_bgr = get_capture().mirror_frame(frame_bgr)
-            pose = self._backend.infer(frame_bgr, frame_index=len(self._samples), timestamp=elapsed)
-            landmarks = pose.landmarks
-
-        if landmarks:
-            self._samples.append(landmarks)
-
-        if elapsed >= settings.calibration_seconds:
-            from ..core.types import RestPoseStyle
-            from ..mapping.apply_pose import average_calibrations
-
-            if len(self._samples) < 3:
-                self.report({"ERROR"}, "Not enough landmark samples for calibration")
-                return self._done(context, ok=False)
-
-            cal = average_calibrations(self._samples)
-            cal.rest_style = RestPoseStyle[settings.rest_pose_style]
-            # Apply subject scale prop
-            cal.scale *= settings.subject_scale
-            _CALIBRATION = cal
-            settings.is_calibrated = cal.valid
-            self.report(
-                {"INFO"},
-                f"Calibration complete ({len(self._samples)} samples, scale={cal.scale:.3f})",
-            )
-            return self._done(context, ok=True)
-
-        return {"PASS_THROUGH"}
-
-    def _done(self, context, ok=True):
-        wm = context.window_manager
-        if self._timer:
-            wm.event_timer_remove(self._timer)
-            self._timer = None
-        if self._backend and not context.scene.bodymocap.camera_active:
-            self._backend.shutdown()
-            # Don't close camera if user had it for other reasons; if we opened it alone:
-            if not context.scene.bodymocap.camera_active:
-                from ..camera.capture import get_capture
-
-                # Only release if camera_active is false (we may have opened for calib)
-                if context.scene.bodymocap.pose_backend == "MEDIAPIPE":
-                    get_capture().close()
-        return {"FINISHED"} if ok else {"CANCELLED"}
-
-
-CLASSES = (
-    BODYMOCAP_OT_camera_start,
-    BODYMOCAP_OT_camera_stop,
-    BODYMOCAP_OT_calibrate,
-)
+CLASSES = (POSE_OT_spawn_camera,)
 
 
 def register():
-    if bpy is None:
-        return
-    for cls in CLASSES:
-        bpy.utils.register_class(cls)
+    for c in CLASSES:
+        bpy.utils.register_class(c)
 
 
 def unregister():
-    if bpy is None:
-        return
-    for cls in reversed(CLASSES):
-        bpy.utils.unregister_class(cls)
+    for c in reversed(CLASSES):
+        bpy.utils.unregister_class(c)

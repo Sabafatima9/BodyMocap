@@ -1,98 +1,159 @@
-"""Bake and apply operators (FR-060–063)."""
+"""POSE_OT_bake_animation and take / action management operators."""
 
 from __future__ import annotations
 
-try:
-    import bpy
-    from bpy.types import Operator
-except ImportError:
-    bpy = None
-    Operator = object  # type: ignore
+import bpy
+from bpy.props import StringProperty
+from bpy.types import Operator
+from bpy_extras.io_utils import ExportHelper, ImportHelper
+
+from ..runtime import calibration_from_take, get_profile, get_runtime, smoothing_params, solver_settings, target_objects
 
 
-class BODYMOCAP_OT_bake_action(Operator):
-    bl_idname = "bodymocap.bake_action"
-    bl_label = "Bake to Action"
-    bl_description = "Bake recorded take into a Blender Action"
+def apply_action(obj, action, mode: str = "ACTION", start_frame: int = 1) -> str:
+    from ..utils.anim_compat import assign_action
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    ad = obj.animation_data
+    if mode == "NLA":
+        track = ad.nla_tracks.get("BodyMocap") or ad.nla_tracks.new()
+        track.name = "BodyMocap"
+        for strip in list(track.strips):
+            if strip.action == action:
+                track.strips.remove(strip)
+        strip = track.strips.new(action.name, int(start_frame), action)
+        ad.action = None
+        return f"NLA strip '{strip.name}' on {obj.name}"
+    assign_action(obj, action)
+    return f"Action '{action.name}' assigned to {obj.name}"
+
+
+class POSE_OT_bake_animation(Operator):
+    """Bake the last recorded take into Actions on the target rig(s) and apply them"""
+
+    bl_idname = "pose.bake_animation"
+    bl_label = "Bake Animation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return get_runtime().last_take is not None
 
     def execute(self, context):
-        from ..bake.action import bake_session_to_action
-        from ..recording.session import get_active_session
+        from ..bake.action import BakeSettings, bake_take
 
-        arm = context.active_object
-        if arm is None or arm.type != "ARMATURE":
-            self.report({"ERROR"}, "Select an Armature object")
+        s = context.scene.bodymocap
+        rt = get_runtime()
+        take = rt.last_take
+        if take is None or take.frame_count() < 2:
+            self.report({"ERROR"}, "No recorded take to bake")
             return {"CANCELLED"}
-
-        settings = context.scene.bodymocap
-        session = get_active_session()
-        if session.frame_count() == 0:
-            self.report({"ERROR"}, "No recorded frames to bake")
+        targets = target_objects(s, include_extra=s.bake_all_targets)
+        if not targets:
+            self.report({"ERROR"}, "Set a target armature first")
             return {"CANCELLED"}
-
-        if session.should_warn_tracking():
-            self.report({"WARNING"}, session.tracking_warning_message())
-
-        rot_mode = "QUATERNION" if settings.rotation_mode == "QUATERNION" else "EULER"
-        ok, msg, action = bake_session_to_action(
-            session.frames,
-            arm,
-            action_name=settings.action_name,
-            start_frame=settings.bake_start_frame,
-            overwrite=settings.overwrite_action,
-            rotation_mode=rot_mode,
-        )
-        if not ok:
-            self.report({"ERROR"}, msg)
+        cal = rt.calibration
+        if cal is None and s.calibrate_from_take:
+            cal = calibration_from_take(take, s.calibration_seconds, s.min_visibility)
+        scene = context.scene
+        fps = scene.render.fps / scene.render.fps_base
+        rt.last_bake = {}
+        last_end = s.start_frame
+        for i, obj in enumerate(targets):
+            name = s.action_name if i == 0 else f"{s.action_name}_{obj.name}"
+            bs = BakeSettings(action_name=name, start_frame=s.start_frame, fps=fps,
+                              overwrite=s.overwrite_action, rotation_mode=s.rotation_mode,
+                              interpolation=s.interpolation, smoothing=smoothing_params(s),
+                              min_conf=s.min_visibility)
+            profile = get_profile(obj)
+            ok, msg, action, stats = bake_take(obj, take.frames, profile, bs, solver_settings(s), cal)
+            if not ok:
+                self.report({"ERROR"}, f"{obj.name}: {msg}")
+                continue
+            apply_msg = apply_action(obj, action, s.apply_mode, s.start_frame)
+            rt.last_bake[obj.name] = {"action": action.name, "stats": stats}
+            last_end = max(last_end, s.start_frame + stats.frames - 1)
+            self.report({"INFO"}, f"{msg}; {apply_msg}")
+        if not rt.last_bake:
             return {"CANCELLED"}
-        if action:
-            settings.action_name = action.name
-        self.report({"INFO"}, msg)
+        if s.set_scene_range:
+            scene.frame_start = s.start_frame
+            scene.frame_end = last_end
+            scene.frame_set(s.start_frame)
         return {"FINISHED"}
 
 
-class BODYMOCAP_OT_apply_action(Operator):
-    bl_idname = "bodymocap.apply_action"
+class POSE_OT_apply_mocap_action(Operator):
+    """Assign an existing Action (or NLA strip) to the target armature"""
+
+    bl_idname = "pose.apply_mocap_action"
     bl_label = "Apply Action"
-    bl_description = "One-click assign baked Action (or NLA strip) to armature"
+    bl_options = {"REGISTER", "UNDO"}
+
+    action: StringProperty(name="Action")
 
     def execute(self, context):
-        from ..bake.apply import apply_action_to_armature
-
-        arm = context.active_object
-        if arm is None or arm.type != "ARMATURE":
-            self.report({"ERROR"}, "Select an Armature object")
+        s = context.scene.bodymocap
+        obj = s.target
+        if obj is None:
+            self.report({"ERROR"}, "Set a target armature first")
             return {"CANCELLED"}
-
-        settings = context.scene.bodymocap
-        ok, msg = apply_action_to_armature(
-            arm,
-            settings.action_name,
-            mode=settings.apply_mode,
-            start_frame=settings.bake_start_frame,
-        )
-        if not ok:
-            self.report({"ERROR"}, msg)
+        act = bpy.data.actions.get(self.action or s.action_name)
+        if act is None:
+            self.report({"ERROR"}, f"Action '{self.action or s.action_name}' not found")
             return {"CANCELLED"}
-        self.report({"INFO"}, msg)
+        self.report({"INFO"}, apply_action(obj, act, s.apply_mode, s.start_frame))
         return {"FINISHED"}
 
 
-CLASSES = (
-    BODYMOCAP_OT_bake_action,
-    BODYMOCAP_OT_apply_action,
-)
+class POSE_OT_save_take(Operator, ExportHelper):
+    """Save the last recorded take (landmarks, not video) to a JSON file"""
+
+    bl_idname = "pose.save_take"
+    bl_label = "Save Take"
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return get_runtime().last_take is not None
+
+    def execute(self, context):
+        take = get_runtime().last_take
+        path = take.save(bpy.path.abspath(self.filepath))
+        self.report({"INFO"}, f"Saved {take.frame_count()} frames to {path}")
+        return {"FINISHED"}
+
+
+class POSE_OT_load_take(Operator, ImportHelper):
+    """Load a take file so it can be baked onto any rig"""
+
+    bl_idname = "pose.load_take"
+    bl_label = "Load Take"
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        from ..recording.session import Take
+        try:
+            take = Take.load(bpy.path.abspath(self.filepath))
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not load take: {exc}")
+            return {"CANCELLED"}
+        get_runtime().last_take = take
+        context.scene.bodymocap.take_frame_count = take.frame_count()
+        self.report({"INFO"}, f"Loaded take '{take.name}' ({take.frame_count()} frames)")
+        return {"FINISHED"}
+
+
+CLASSES = (POSE_OT_bake_animation, POSE_OT_apply_mocap_action, POSE_OT_save_take, POSE_OT_load_take)
 
 
 def register():
-    if bpy is None:
-        return
-    for cls in CLASSES:
-        bpy.utils.register_class(cls)
+    for c in CLASSES:
+        bpy.utils.register_class(c)
 
 
 def unregister():
-    if bpy is None:
-        return
-    for cls in reversed(CLASSES):
-        bpy.utils.unregister_class(cls)
+    for c in reversed(CLASSES):
+        bpy.utils.unregister_class(c)

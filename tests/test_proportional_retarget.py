@@ -1,4 +1,4 @@
-"""Unit tests for N:M proportional remapping (FR-072–074)."""
+"""Length-proportional rotation distribution (theta_i = theta * L_i / sum L)."""
 
 from __future__ import annotations
 
@@ -12,80 +12,69 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bodymocap.core.math3d import (
+    X_AXIS,
+    Z_AXIS,
     cumulative_quat_product,
     euler_xyz_to_quat,
     quat_angle_deg,
+    quat_from_axis_angle,
     quat_identity,
-    quat_normalize,
 )
-from bodymocap.core.types import Quat
+from bodymocap.core.types import Vec3
 from bodymocap.retarget.proportional import (
-    aggregate_rotations,
-    assign_source_intervals_to_targets,
-    example_arm_2_to_4,
-    example_arm_4_to_2,
+    chain_parameter_breaks,
+    chain_product,
+    cumulative_rotations,
+    distribute_rotation,
     remap_chain,
-    split_rotations,
 )
 
 
-def _rx(degrees: float) -> Quat:
-    return euler_xyz_to_quat(math.radians(degrees), 0.0, 0.0)
+def _rx(deg):
+    return euler_xyz_to_quat(math.radians(deg), 0.0, 0.0)
 
 
-class TestProportionalRetarget(unittest.TestCase):
-    def test_intervals_4_to_2_equal(self):
-        intervals = assign_source_intervals_to_targets(
-            [1, 1, 1, 1], [2, 2]
-        )
-        self.assertEqual(len(intervals), 2)
-        # Cover all 4 segments without gaps
-        self.assertEqual(intervals[0][0], 0)
-        self.assertEqual(intervals[-1][1], 4)
-        self.assertEqual(intervals[0][1], intervals[1][0])
+class TestProportional(unittest.TestCase):
+    def test_breaks(self):
+        self.assertEqual(chain_parameter_breaks([1, 1, 2]), [0.0, 0.25, 0.5, 1.0])
+        self.assertEqual(chain_parameter_breaks([]), [0.0, 1.0])
 
-    def test_aggregate_4_to_2(self):
-        # Four small bends → two bones
-        src = [_rx(10), _rx(10), _rx(15), _rx(15)]
-        out = example_arm_4_to_2(src, [1, 1, 1, 1], [2, 2])
-        self.assertEqual(len(out), 2)
-        # Proximal aggregate ≈ 20°, distal ≈ 30° (cumulative)
-        proximal = cumulative_quat_product([_rx(10), _rx(10)])
-        distal = cumulative_quat_product([_rx(15), _rx(15)])
-        self.assertLess(quat_angle_deg(out[0], proximal), 1.0)
-        self.assertLess(quat_angle_deg(out[1], distal), 1.0)
+    def test_increments_proportional_to_length(self):
+        total = quat_from_axis_angle(Vec3(0.2, 1.0, 0.3), math.radians(60.0))
+        lengths = [0.1, 0.3, 0.2]
+        inc = distribute_rotation(total, lengths)
+        angles = [quat_angle_deg(q, quat_identity()) for q in inc]
+        for a, L in zip(angles, lengths):
+            self.assertAlmostEqual(a, 60.0 * L / sum(lengths), places=6)
+        self.assertLess(quat_angle_deg(chain_product(inc), total), 1e-6)
 
-    def test_split_2_to_4(self):
+    def test_cumulative(self):
+        total = quat_from_axis_angle(Z_AXIS, math.radians(90.0))
+        cum = cumulative_rotations(total, [1.0, 1.0, 2.0])
+        self.assertAlmostEqual(quat_angle_deg(cum[0], quat_identity()), 22.5, places=6)
+        self.assertAlmostEqual(quat_angle_deg(cum[1], quat_identity()), 45.0, places=6)
+        self.assertLess(quat_angle_deg(cum[2], total), 1e-6)
+
+    def test_remap_2_to_4_preserves_chain_rotation(self):
         src = [_rx(20), _rx(40)]
-        out = example_arm_2_to_4(src, [2, 2], [1, 1, 1, 1])
+        out = remap_chain(src, [2, 2], [1, 1, 1, 1])
         self.assertEqual(len(out), 4)
-        # Total chain product should approximate source product
-        src_total = cumulative_quat_product(src)
-        out_total = cumulative_quat_product(out)
-        self.assertLess(quat_angle_deg(src_total, out_total), 2.0)
+        self.assertLess(quat_angle_deg(cumulative_quat_product(out), cumulative_quat_product(src)), 1e-6)
+        # equal lengths -> equal increments
+        a = [quat_angle_deg(q, quat_identity()) for q in out]
+        self.assertAlmostEqual(max(a), min(a), places=6)
 
-    def test_remap_dispatch(self):
-        src4 = [_rx(5), _rx(5), _rx(5), _rx(5)]
-        a = remap_chain(src4, [1, 1, 1, 1], [2, 2])
-        self.assertEqual(len(a), 2)
-        src2 = [_rx(10), _rx(10)]
-        b = remap_chain(src2, [2, 2], [1, 1, 1, 1])
-        self.assertEqual(len(b), 4)
+    def test_remap_4_to_2(self):
+        src = [_rx(10), _rx(10), _rx(15), _rx(15)]
+        out = remap_chain(src, [1, 1, 1, 1], [3, 1])
+        self.assertLess(quat_angle_deg(cumulative_quat_product(out), cumulative_quat_product(src)), 1e-6)
+        self.assertAlmostEqual(quat_angle_deg(out[0], quat_identity()), 37.5, places=6)
 
-    def test_equal_n_m(self):
+    def test_equal_topology_passthrough(self):
         src = [_rx(12), _rx(8), _rx(4)]
         out = remap_chain(src, [1, 1, 1], [1, 1, 1])
-        self.assertEqual(len(out), 3)
         for a, b in zip(src, out):
-            self.assertLess(quat_angle_deg(a, b), 0.01)
-
-    def test_unequal_lengths_4_to_2(self):
-        src = [_rx(10), _rx(10), _rx(10), _rx(10)]
-        # Longer proximal target bone should absorb more source segments
-        out = aggregate_rotations(src, [1, 1, 1, 1], [3, 1])
-        self.assertEqual(len(out), 2)
-        intervals = assign_source_intervals_to_targets([1, 1, 1, 1], [3, 1])
-        self.assertGreaterEqual(intervals[0][1] - intervals[0][0], intervals[1][1] - intervals[1][0])
+            self.assertLess(quat_angle_deg(a, b), 1e-9)
 
 
 if __name__ == "__main__":

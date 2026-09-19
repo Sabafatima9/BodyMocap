@@ -1,150 +1,243 @@
-"""Scene / collection properties for BodyMocap."""
+"""Scene settings and UI collections for BodyMocap."""
 
 from __future__ import annotations
 
-try:
-    import bpy
-    from bpy.props import (
-        BoolProperty,
-        CollectionProperty,
-        EnumProperty,
-        FloatProperty,
-        IntProperty,
-        PointerProperty,
-        StringProperty,
-    )
-    from bpy.types import PropertyGroup
-except ImportError:
-    bpy = None
-    PropertyGroup = object  # type: ignore
+import bpy
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
+from bpy.types import PropertyGroup
+
+from .pose.synthetic import CLIPS, CONDITIONS
 
 
-class BODYMOCAP_PG_MapEntry(PropertyGroup):
-    role: StringProperty(name="Role", default="")
-    bone_name: StringProperty(name="Bone", default="")
+def _is_armature(self, obj):
+    return obj is not None and obj.type == "ARMATURE"
 
 
-class BODYMOCAP_PG_Settings(PropertyGroup):
-    # Camera
-    camera_device_index: IntProperty(name="Camera Device", default=0, min=0, max=16)
-    camera_active: BoolProperty(name="Camera Active", default=False)
-    mirror_preview: BoolProperty(name="Mirror", default=True)
-    subject_scale: FloatProperty(name="Subject Scale", default=1.0, min=0.1, max=10.0)
-    subject_distance: FloatProperty(name="Subject Distance", default=2.0, min=0.3, max=20.0)
-    show_overlay: BoolProperty(name="Show Overlay", default=True)
+def _target_changed(self, context):
+    from .runtime import get_runtime
+    get_runtime().solvers.clear()
 
-    # Pose / tracking
-    pose_backend: EnumProperty(
-        name="Backend",
+
+def _solver_changed(self, context):
+    from .runtime import get_runtime
+    get_runtime().solvers.clear()
+
+
+class BODYMOCAP_PG_target(PropertyGroup):
+    obj: PointerProperty(name="Armature", type=bpy.types.Object, poll=_is_armature,
+                         update=_target_changed)
+    enabled: BoolProperty(name="Enabled", default=True)
+
+
+CHAIN_ITEMS = [
+    ("hips", "Hips", "Root / pelvis bone"),
+    ("spine", "Spine", "Hips (excl.) to chest (incl.)"),
+    ("neck", "Neck", "Neck bones"),
+    ("head", "Head", "Head bone"),
+    ("arm_L", "Arm L", ""), ("arm_R", "Arm R", ""),
+    ("leg_L", "Leg L", ""), ("leg_R", "Leg R", ""),
+]
+SEGMENT_ITEMS = [
+    ("CORE", "Core", "Hips / spine / neck / head bone"),
+    ("ROOT", "Root", "Clavicle / hip-side bone (kept at rest)"),
+    ("UPPER", "Upper", "Upper arm / thigh segment"),
+    ("LOWER", "Lower", "Forearm / shin segment"),
+    ("END", "End", "Hand / foot"),
+    ("EXTRA", "Extra", "Toes etc. (kept at rest)"),
+]
+
+
+class BODYMOCAP_PG_chain_entry(PropertyGroup):
+    chain: EnumProperty(name="Chain", items=CHAIN_ITEMS)
+    segment: EnumProperty(name="Segment", items=SEGMENT_ITEMS)
+    bone: StringProperty(name="Bone")
+
+
+class BODYMOCAP_PG_settings(PropertyGroup):
+    # ------------------------------------------------------------------ target
+    target: PointerProperty(name="Target Armature", type=bpy.types.Object, poll=_is_armature,
+                            update=_target_changed,
+                            description="Armature driven by the capture (rig selection)")
+    extra_targets: CollectionProperty(type=BODYMOCAP_PG_target)
+    extra_index: IntProperty(default=0)
+    live_apply: BoolProperty(name="Live Preview on Rig", default=True,
+                             description="Pose the target armature(s) while tracking")
+    live_apply_all_targets: BoolProperty(name="Drive All Targets Live", default=True)
+
+    # ------------------------------------------------------------------ source
+    source: EnumProperty(
+        name="Source",
         items=[
-            ("MEDIAPIPE", "MediaPipe", "On-device MediaPipe Pose"),
-            ("MOCK", "Mock / Offline", "Synthetic or fixture landmarks"),
+            ("WEBCAM", "Webcam", "Live camera via OpenCV", "OUTLINER_OB_CAMERA", 0),
+            ("VIDEO", "Video File", "Track a recorded video", "FILE_MOVIE", 1),
+            ("IMAGES", "Image Sequence", "Track a folder of frames", "FILE_IMAGE", 2),
+            ("SYNTHETIC", "Synthetic Performer", "Procedural test performer (no camera needed)",
+             "ARMATURE_DATA", 3),
+            ("TAKE", "Recorded Take", "Replay a saved take file", "FILE_BLANK", 4),
         ],
-        default="MOCK",
+        default="WEBCAM",
     )
-    mock_mode: EnumProperty(
-        name="Mock Mode",
-        items=[
-            ("walk", "Walk", "Synthetic walk cycle"),
-            ("idle", "Idle", "Standing idle"),
-            ("fixture", "Fixture", "JSON fixture sequence"),
-        ],
-        default="walk",
-    )
-    fixture_path: StringProperty(name="Fixture Path", default="", subtype="FILE_PATH")
-    min_confidence: FloatProperty(name="Min Confidence", default=0.5, min=0.0, max=1.0)
-    lost_policy: EnumProperty(
-        name="Lost Policy",
-        items=[
-            ("hold_last", "Hold Last", "Keep last valid pose"),
-            ("interpolate", "Interpolate", "Brief hold then drop"),
-            ("drop", "Drop", "Do not apply invalid frames"),
-        ],
-        default="hold_last",
-    )
-    tracking_status: StringProperty(name="Tracking", default="Lost")
-
-    # Calibration
-    rest_pose_style: EnumProperty(
-        name="Rest Pose",
-        items=[
-            ("T_POSE", "T-Pose", "Arms horizontal"),
-            ("A_POSE", "A-Pose", "Arms slightly down"),
-        ],
-        default="T_POSE",
-    )
-    calibration_seconds: FloatProperty(name="Calibration Duration", default=2.0, min=0.5, max=10.0)
-    is_calibrated: BoolProperty(name="Calibrated", default=False)
-
-    # Mapping
-    mapping_entries: CollectionProperty(type=BODYMOCAP_PG_MapEntry)
-    mapping_index: IntProperty(name="Mapping Index", default=0)
-    preset_path: StringProperty(name="Preset Path", default="", subtype="FILE_PATH")
-    mapping_quality: StringProperty(name="Mapping Quality", default="")
-
-    # Recording
-    is_recording: BoolProperty(name="Recording", default=False)
-    is_paused: BoolProperty(name="Paused", default=False)
-    record_frame_count: IntProperty(name="Recorded Frames", default=0)
-    degraded_warn_fraction: FloatProperty(
-        name="Degraded Warn Fraction", default=0.15, min=0.0, max=1.0
-    )
-
-    # Bake / apply
-    action_name: StringProperty(name="Action Name", default="BodyMocapAction")
-    bake_start_frame: IntProperty(name="Start Frame", default=1, min=0)
-    overwrite_action: BoolProperty(name="Overwrite Action", default=True)
-    apply_mode: EnumProperty(
-        name="Apply Mode",
-        items=[
-            ("action", "Assign Action", "Set as active action"),
-            ("nla", "NLA Strip", "Push to NLA track"),
-        ],
-        default="action",
-    )
-    rotation_mode: EnumProperty(
-        name="Rotation Mode",
-        items=[
-            ("QUATERNION", "Quaternion", ""),
-            ("EULER", "Euler XYZ", ""),
-        ],
-        default="QUATERNION",
-    )
-
-    # Retarget
-    source_armature: StringProperty(name="Source Armature", default="")
-    target_armature: StringProperty(name="Target Armature", default="")
-    retarget_action: StringProperty(name="Source Action", default="")
-    retarget_new_action: StringProperty(name="New Action Name", default="RetargetedAction")
-
-    # Privacy / debug
+    device_index: IntProperty(name="Camera Index", default=0, min=0, max=16)
+    video_path: StringProperty(name="Video", subtype="FILE_PATH")
+    image_dir: StringProperty(name="Images", subtype="DIR_PATH")
+    take_path: StringProperty(name="Take File", subtype="FILE_PATH")
+    loop_source: BoolProperty(name="Loop", default=False)
+    capture_width: IntProperty(name="Width", default=640, min=160, max=3840)
+    capture_height: IntProperty(name="Height", default=480, min=120, max=2160)
+    capture_fps: FloatProperty(name="FPS", default=30.0, min=1.0, max=120.0)
+    tracking_fov: FloatProperty(name="Camera FOV", default=60.0, min=10.0, max=150.0,
+                                description="Horizontal field of view of the physical camera "
+                                            "(used by the spawned camera and root tracking)")
+    camera_distance: FloatProperty(name="Subject Distance", default=0.0, min=0.0, max=30.0,
+                                   description="Camera distance for Spawn Camera (0 = fit rig)")
+    mirror_preview: BoolProperty(name="Mirror Preview", default=True,
+                                 description="Show the camera image mirrored (selfie view)")
+    mirror_motion: BoolProperty(name="Mirror Motion", default=False,
+                                description="Rig moves like a mirror image of the performer")
+    show_overlay: BoolProperty(name="Skeleton Overlay", default=True)
     save_debug_video: BoolProperty(
-        name="Save Debug Video",
-        description="Persist raw video only when explicitly enabled (FR-092)",
-        default=False,
+        name="Keep Preview Frames", default=False,
+        description="Never write raw video to disk unless enabled (privacy, FR-092)")
+
+    # synthetic performer
+    synth_clip: EnumProperty(name="Motion", items=[(k, k.replace("_", " ").title(), "") for k in CLIPS],
+                             default="wave")
+    synth_condition: EnumProperty(name="Lighting Sim",
+                                  items=[(k, k.replace("_", " ").title(), "") for k in CONDITIONS],
+                                  default="normal")
+    synth_speed: FloatProperty(name="Speed", default=1.0, min=0.1, max=4.0)
+    synth_duration: FloatProperty(name="Duration (offline)", default=4.0, min=0.1, max=600.0,
+                                  description="Length of the synthetic performance when "
+                                              "processed offline / in background mode")
+
+    # ------------------------------------------------------------ tracking
+    model_variant: EnumProperty(
+        name="Model",
+        items=[("LITE", "Lite", "Fastest (~5 MB)"), ("FULL", "Full", "Balanced (~9 MB)"),
+               ("HEAVY", "Heavy", "Most accurate, slow on CPU (~29 MB)")],
+        default="FULL",
     )
-    deps_status: StringProperty(name="Deps Status", default="")
-    live_apply: BoolProperty(
-        name="Live Apply Pose",
-        description="Drive selected armature while camera/mock is running",
-        default=True,
+    min_detection: FloatProperty(name="Detection", default=0.5, min=0.05, max=0.99,
+                                 description="Minimum person-detection confidence")
+    min_presence: FloatProperty(name="Presence", default=0.5, min=0.05, max=0.99)
+    min_tracking: FloatProperty(name="Tracking", default=0.5, min=0.05, max=0.99,
+                                description="Minimum confidence to keep tracking between frames")
+    min_visibility: FloatProperty(name="Landmark Sensitivity", default=0.5, min=0.05, max=0.99,
+                                  description="Landmarks below this visibility are treated as "
+                                              "lost (held briefly, then chains hold pose)",
+                                  update=_solver_changed)
+    smoothing_enabled: BoolProperty(name="Smoothing", default=True)
+    smooth_min_cutoff: FloatProperty(name="Min Cutoff (Hz)", default=1.0, min=0.05, max=10.0,
+                                     description="Lower = smoother slow motion")
+    smooth_beta: FloatProperty(name="Speed Response", default=5.0, min=0.0, max=50.0,
+                               description="Higher = less lag on fast gestures")
+
+    # ------------------------------------------------------------ lighting
+    exposure_mode: EnumProperty(
+        name="Exposure",
+        items=[("OFF", "Off", "Feed frames unchanged"),
+               ("AUTO", "Auto", "Auto contrast / gamma, CLAHE for back-light"),
+               ("MANUAL", "Manual", "Fixed gain / gamma / contrast")],
+        default="AUTO",
     )
+    exposure_ev: FloatProperty(name="Gain (EV)", default=0.0, min=-4.0, max=4.0)
+    exposure_gamma: FloatProperty(name="Gamma", default=1.0, min=0.2, max=3.0)
+    exposure_contrast: FloatProperty(name="Contrast", default=1.0, min=0.2, max=3.0)
+    exposure_clahe: BoolProperty(name="Local Contrast (CLAHE)", default=True)
+    exposure_clahe_clip: FloatProperty(name="CLAHE Clip", default=2.0, min=0.5, max=8.0)
+
+    # ------------------------------------------------------------- solver
+    root_motion: BoolProperty(name="Root Motion", default=False, update=_solver_changed,
+                              description="Translate the hips from the camera-space position")
+    root_scale: FloatProperty(name="Root Scale", default=0.0, min=0.0, max=100.0,
+                              update=_solver_changed,
+                              description="0 = automatic (rig leg length / performer leg length)")
+    anti_knee_inversion: BoolProperty(name="Prevent Knee Inversion", default=True,
+                                      update=_solver_changed)
+    pole_blend_lo: FloatProperty(name="Straight Limb Below", default=6.0, min=0.0, max=45.0,
+                                 update=_solver_changed,
+                                 description="Bend angle (deg) under which the pole vector falls "
+                                             "back to its stable estimate")
+    pole_blend_hi: FloatProperty(name="Trusted Bend Above", default=25.0, min=1.0, max=90.0,
+                                 update=_solver_changed)
+    twist_share: FloatProperty(name="Forearm Twist", default=1.0, min=0.0, max=1.0,
+                               update=_solver_changed,
+                               description="Share of hand twist distributed along the forearm")
+    pelvis_tilt_share: FloatProperty(name="Pelvis Tilt Share", default=0.5, min=0.0, max=1.0,
+                                     update=_solver_changed)
+    spine_position_match: BoolProperty(name="Match Shoulder Position", default=True,
+                                       update=_solver_changed)
+    drive_hands: BoolProperty(name="Hands", default=True, update=_solver_changed)
+    drive_feet: BoolProperty(name="Feet", default=True, update=_solver_changed)
+    drive_head: BoolProperty(name="Head", default=True, update=_solver_changed)
+
+    # ------------------------------------------------------------- calibration
+    rest_pose_style: EnumProperty(name="Rest Pose", items=[("T_POSE", "T-Pose", ""), ("A_POSE", "A-Pose", "")],
+                                  default="T_POSE")
+    calibration_seconds: FloatProperty(name="Duration", default=2.0, min=0.5, max=10.0)
+    is_calibrated: BoolProperty(default=False)
+    calibration_status: StringProperty(default="Not calibrated")
+    calibrate_from_take: BoolProperty(name="Calibrate From Take Start", default=False,
+                                      description="Use the first seconds of the take as the neutral pose")
+
+    # ------------------------------------------------------------- record / bake
+    action_name: StringProperty(name="Action", default="MocapTake")
+    start_frame: IntProperty(name="Start Frame", default=1)
+    overwrite_action: BoolProperty(name="Overwrite", default=True)
+    rotation_mode: EnumProperty(name="Rotation", items=[("QUATERNION", "Quaternion", ""),
+                                                        ("EULER", "Euler XYZ", "")], default="QUATERNION")
+    interpolation: EnumProperty(name="Interpolation", items=[("LINEAR", "Linear", ""),
+                                                             ("BEZIER", "Bezier", "")], default="LINEAR")
+    apply_mode: EnumProperty(name="Apply As", items=[("ACTION", "Active Action", ""),
+                                                     ("NLA", "NLA Strip", "")], default="ACTION")
+    auto_bake: BoolProperty(name="Bake on Stop", default=True,
+                            description="One-click: stopping the recording bakes and applies the Action")
+    bake_all_targets: BoolProperty(name="Bake All Targets", default=True)
+    set_scene_range: BoolProperty(name="Set Scene Range", default=True)
+    degraded_warn_fraction: FloatProperty(name="Warn If Degraded >", default=0.15, min=0.0, max=1.0,
+                                          subtype="FACTOR")
+
+    # ------------------------------------------------------------- retarget
+    retarget_source: PointerProperty(name="Source Armature", type=bpy.types.Object, poll=_is_armature)
+    retarget_action: StringProperty(name="Source Action")
+    retarget_new_action: StringProperty(name="New Action", default="RetargetedAction")
+
+    # ------------------------------------------------------------- topology editing
+    profile_entries: CollectionProperty(type=BODYMOCAP_PG_chain_entry)
+    profile_index: IntProperty(default=0)
+    profile_summary: StringProperty(default="")
+    profile_warnings: StringProperty(default="")
+
+    # ------------------------------------------------------------- status
+    tracking_status: StringProperty(default="Idle")
+    lighting_status: StringProperty(default="-")
+    capture_fps_live: FloatProperty(default=0.0)
+    is_capturing: BoolProperty(default=False)
+    is_recording: BoolProperty(default=False)
+    record_frame_count: IntProperty(default=0)
+    take_frame_count: IntProperty(default=0)
+    status_text: StringProperty(default="")
+    deps_status: StringProperty(default="")
 
 
-CLASSES = (BODYMOCAP_PG_MapEntry, BODYMOCAP_PG_Settings)
+CLASSES = (BODYMOCAP_PG_target, BODYMOCAP_PG_chain_entry, BODYMOCAP_PG_settings)
 
 
 def register():
-    if bpy is None:
-        return
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.bodymocap = PointerProperty(type=BODYMOCAP_PG_Settings)
+    bpy.types.Scene.bodymocap = PointerProperty(type=BODYMOCAP_PG_settings)
 
 
 def unregister():
-    if bpy is None:
-        return
     if hasattr(bpy.types.Scene, "bodymocap"):
         del bpy.types.Scene.bodymocap
     for cls in reversed(CLASSES):
